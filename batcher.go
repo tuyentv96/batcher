@@ -2,20 +2,15 @@ package batcher
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"time"
+
+	"github.com/benbjohnson/clock"
 )
 
 var errZeroBoth = errors.New(
-	"muster: MaxBatchSize and BatchTimeout can't both be zero",
+	"batcher: MaxBatchSize and BatchTimeout can't both be zero",
 )
-
-type waitGroup interface {
-	Add(delta int)
-	Done()
-	Wait()
-}
 
 // Notifier is used to indicate to the Client when a batch has finished
 // processing.
@@ -43,42 +38,66 @@ type Batcher[T any] struct {
 	// Maximum number of items in a batch. If this is zero batches will only be
 	// dispatched upon hitting the BatchTimeout. It is an error for both this and
 	// the BatchTimeout to be zero.
-	MaxBatchSize uint
+	maxBatchSize uint
 
 	// Duration after which to send a pending batch. If this is zero batches will
 	// only be dispatched upon hitting the MaxBatchSize. It is an error for both
 	// this and the MaxBatchSize to be zero.
-	BatchTimeout time.Duration
-
-	// MaxConcurrentBatches determines how many parallel batches we'll allow to
-	// be "in flight" concurrently. Once these many batches are in flight, the
-	// PendingWorkCapacity determines when sending to the Work channel will start
-	// blocking. In other words, once MaxConcurrentBatches hits, the system
-	// starts blocking. This allows for tighter control over memory utilization.
-	// If not set, the number of parallel batches in-flight will not be limited.
-	MaxConcurrentBatches uint
+	batchTimeout time.Duration
 
 	// Capacity of work channel. If this is zero, the Work channel will be
 	// blocking.
-	PendingWorkCapacity uint
+	pendingWorkCapacity uint
 
 	// This function should create a new empty Batch on each invocation.
-	BatchMaker func() Batch[T]
+	batchMaker func() Batch[T]
 
 	// Once this Client has been started, send work items here to add to batch.
-	Work chan T
+	work chan T
 
-	workGroup waitGroup
+	workGroup *sync.WaitGroup
+
+	clock clock.Clock
+}
+
+func withMaxBatchSize[T any](maxbatchSize uint) func(*Batcher[T]) {
+	return func(b *Batcher[T]) {
+		b.maxBatchSize = maxbatchSize
+	}
+}
+
+func withBatchTimeout[T any](timeout time.Duration) func(*Batcher[T]) {
+	return func(b *Batcher[T]) {
+		b.batchTimeout = timeout
+	}
+}
+
+func withPendingWorkCapacity[T any](capacity uint) func(*Batcher[T]) {
+	return func(b *Batcher[T]) {
+		b.pendingWorkCapacity = capacity
+	}
+}
+
+func NewBatcher[T any](opts ...func(*Batcher[T])) Batcher[T] {
+	b := Batcher[T]{
+		clock: clock.New(),
+	}
+
+	for _, opt := range opts {
+		opt(&b)
+	}
+
+	return b
 }
 
 // Start the background worker goroutines and get ready for accepting requests.
 func (c *Batcher[T]) Start() error {
-	if int64(c.BatchTimeout) == 0 && c.MaxBatchSize == 0 {
+	if int64(c.batchTimeout) == 0 && c.maxBatchSize == 0 {
 		return errZeroBoth
 	}
 
 	c.workGroup = &sync.WaitGroup{}
-	c.Work = make(chan T, c.PendingWorkCapacity)
+	c.work = make(chan T, c.pendingWorkCapacity)
 	c.workGroup.Add(1) // this is the worker itself
 	go c.worker()
 	return nil
@@ -86,7 +105,7 @@ func (c *Batcher[T]) Start() error {
 
 // Stop gracefully and return once all processing has finished.
 func (c *Batcher[T]) Stop() error {
-	close(c.Work)
+	close(c.work)
 	c.workGroup.Wait()
 	return nil
 }
@@ -94,14 +113,14 @@ func (c *Batcher[T]) Stop() error {
 // Background process.
 func (c *Batcher[T]) worker() {
 	defer c.workGroup.Done()
-	var batch = c.BatchMaker()
+	var batch = c.batchMaker()
 	var count uint
-	var batchTimer *time.Ticker
+	var batchTimer *clock.Ticker
 	var batchTimeout <-chan time.Time
 	send := func() {
 		c.workGroup.Add(1)
 		go batch.Fire(c.workGroup)
-		batch = c.BatchMaker()
+		batch = c.batchMaker()
 		count = 0
 		if batchTimer != nil {
 			batchTimer.Stop()
@@ -116,10 +135,10 @@ func (c *Batcher[T]) worker() {
 		}
 		batch.Add(item)
 		count++
-		if c.MaxBatchSize != 0 && count >= c.MaxBatchSize {
+		if c.maxBatchSize != 0 && count >= c.maxBatchSize {
 			send()
-		} else if int64(c.BatchTimeout) != 0 && count == 1 {
-			batchTimer = time.NewTicker(c.BatchTimeout)
+		} else if int64(c.batchTimeout) != 0 && count == 1 {
+			batchTimer = c.clock.Ticker(c.batchTimeout)
 			batchTimeout = batchTimer.C
 		}
 		return false
@@ -127,14 +146,14 @@ func (c *Batcher[T]) worker() {
 	for {
 		// We use two selects in order to first prefer draining the work queue.
 		select {
-		case item, open := <-c.Work:
-			if recv(item, open) {
+		case item, ok := <-c.work:
+			if recv(item, ok) {
 				return
 			}
 		default:
 			select {
-			case item, open := <-c.Work:
-				if recv(item, open) {
+			case item, ok := <-c.work:
+				if recv(item, ok) {
 					return
 				}
 			case <-batchTimeout:
@@ -142,53 +161,4 @@ func (c *Batcher[T]) worker() {
 			}
 		}
 	}
-}
-
-// The ShoppingClient manages the shopping list and dispatches shoppers.
-type ShoppingClient struct {
-	MaxBatchSize        uint          // How much a shopper can carry at a time.
-	BatchTimeout        time.Duration // How long we wait once we need to get something.
-	PendingWorkCapacity uint          // How long our shopping list can be.
-	batcher             Batcher[string]
-}
-
-// The ShoppingClient has to be started in order to initialize the underlying
-// work channel as well as the background goroutine that handles the work.
-func (s *ShoppingClient) Start() error {
-	s.batcher.MaxBatchSize = s.MaxBatchSize
-	s.batcher.BatchTimeout = s.BatchTimeout
-	s.batcher.PendingWorkCapacity = s.PendingWorkCapacity
-	s.batcher.BatchMaker = func() Batch[string] { return &batch[string]{Client: s} }
-
-	return s.batcher.Start()
-}
-
-// Similarly the ShoppingClient has to be stopped in order to ensure we flush
-// pending items and wait for in progress batches.
-func (s *ShoppingClient) Stop() error {
-	return s.batcher.Stop()
-}
-
-// The ShoppingClient provides a typed Add method which enqueues the work.
-func (s *ShoppingClient) Add(item string) {
-	s.batcher.Work <- item
-}
-
-// The batch is the collection of items that will be dispatched together.
-type batch[T any] struct {
-	Client *ShoppingClient
-	Items  []T
-}
-
-// The batch provides an untyped Add to satisfy the muster.Batch interface. As
-// is the case here, the Batch implementation is internal to the user of muster
-// and not exposed to the users of ShoppingClient.
-func (b *batch[T]) Add(item T) {
-	b.Items = append(b.Items, item)
-}
-
-// Once a Batch is ready, it will be Fired. It must call notifier.Done once the
-// batch has been processed.
-func (b *batch[T]) Fire(notifier Notifier) {
-	fmt.Println("Delivery", b.Items)
 }
